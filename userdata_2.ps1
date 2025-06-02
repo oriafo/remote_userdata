@@ -19,16 +19,16 @@ function Write-Log {
     "$timestamp - $Message" | Out-File -FilePath $LogFile -Append
 }
 
-
-# Parameters
+# Define variables
+$LogFile = "C:\Nginx_Install.log"
 $NginxVersion = "1.25.3"
 $InstallDir = "C:\nginx"
 $DownloadUrl = "https://nginx.org/download/nginx-$NginxVersion.zip"
-$Port = 81  # Changed to port 81
+$Port = 81  # Using 81 to avoid common conflicts
 
-# Ensure script is running as Administrator
+# Ensure admin rights
 if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Host "This script must be run as Administrator. Restarting with elevated privileges..."
+    Write-Host "Restarting as Administrator..."
     Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`"" -Verb RunAs
     exit
 }
@@ -41,68 +41,63 @@ if (-not (Test-Path $InstallDir)) {
 
 # Download Nginx
 $ZipPath = "$env:TEMP\nginx-$NginxVersion.zip"
-Write-Host "Downloading Nginx $NginxVersion..."
-Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath
+Write-Host "Downloading Nginx..."
+Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
 
 # Extract Nginx
-Write-Host "Extracting Nginx to $InstallDir..."
 Expand-Archive -Path $ZipPath -DestinationPath $InstallDir -Force
 
-# Move files from subfolder to root (Nginx extracts into a versioned subdirectory)
-$ExtractedFolder = Get-ChildItem -Path $InstallDir -Directory | Where-Object { $_.Name -like "nginx*" } | Select-Object -First 1
+# Move files from subfolder
+$ExtractedFolder = Get-ChildItem -Path $InstallDir -Directory -Filter "nginx-*" | Select-Object -First 1
 if ($ExtractedFolder) {
-    Get-ChildItem -Path $ExtractedFolder.FullName | Move-Item -Destination $InstallDir -Force
+    Move-Item -Path "$($ExtractedFolder.FullName)\*" -Destination $InstallDir -Force
     Remove-Item -Path $ExtractedFolder.FullName -Force
 }
 
-# Modify Nginx configuration to use port 81
+# Configure Nginx
 $NginxConfPath = "$InstallDir\conf\nginx.conf"
-(Get-Content $NginxConfPath) -replace 'listen\s+80;', "listen       $Port;" | Set-Content $NginxConfPath
-Write-Host "Configured Nginx to use port $Port"
+(Get-Content $NginxConfPath) -replace 'listen\s+80;', "listen $Port;" | Set-Content $NginxConfPath
 
-# Install Nginx as a Windows service
-$NginxExePath = "$InstallDir\nginx.exe"
-if (Test-Path $NginxExePath) {
-    Write-Host "Installing Nginx service..."
-    
-    # Temporarily start Nginx to register the service
-    Start-Process -FilePath $NginxExePath -NoNewWindow -Wait
-    
-    # Stop Nginx (it auto-starts after install)
-    Start-Sleep -Seconds 2
-    Stop-Process -Name "nginx" -Force -ErrorAction SilentlyContinue
-    
-    # Configure service to auto-start
-    Set-Service -Name "nginx" -StartupType Automatic -ErrorAction SilentlyContinue
-    
-    # Start Nginx service
-    Start-Service -Name "nginx" -ErrorAction SilentlyContinue
-    Write-Host "Nginx service started."
-} else {
-    Write-Error "Nginx executable not found at $NginxExePath"
-    exit 1
+# Set permissions
+icacls $InstallDir /grant "Everyone:(OI)(CI)F" /T
+
+# Install service (proper method)
+$ServiceName = "nginx"
+if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+    Stop-Service $ServiceName -Force
+    sc.exe delete $ServiceName
 }
 
-# Add firewall rule for HTTP (port 81)
-Write-Host "Configuring firewall for HTTP (port $Port)..."
+Start-Process -FilePath "$InstallDir\nginx.exe" -Wait
+Start-Sleep -Seconds 2
+Stop-Process -Name "nginx" -Force -ErrorAction SilentlyContinue
+
+# Create service manually for better reliability
+sc.exe create $ServiceName binPath= "`"$InstallDir\nginx.exe`" -p `"$InstallDir`"" start= auto DisplayName= "Nginx Web Server"
+Start-Service $ServiceName
+
+# Configure firewall
 if (-not (Get-NetFirewallRule -Name "Nginx_HTTP" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name "Nginx_HTTP" -DisplayName "Nginx HTTP (TCP $Port)" -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Enabled True | Out-Null
+    New-NetFirewallRule -Name "Nginx_HTTP" -DisplayName "Nginx HTTP (TCP $Port)" `
+        -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Enabled True | Out-Null
 }
 
-# Verify Nginx is running
+# Verify
+Start-Sleep -Seconds 3
 try {
     $nginxProcess = Get-Process -Name "nginx" -ErrorAction Stop
-    Write-Host "Nginx is running (PID: $($nginxProcess.Id)). Open http://localhost:$Port in your browser."
-    Write-Log "nginx is running"
-
-    # Verify port is listening
-    $listening = netstat -ano | findstr ":$Port"
-    if (-not $listening) {
-        Write-Warning "Nginx is not listening on port $Port. Check configuration."
-        Write-Log "successful installation"
+    Write-Host "Nginx running (PID: $($nginxProcess.Id)). Access: http://localhost:$Port"
+    
+    # Test connection
+    $response = Invoke-WebRequest "http://localhost:$Port" -UseBasicParsing -ErrorAction SilentlyContinue
+    if ($response.StatusCode -eq 200) {
+        Write-Host "Nginx is serving requests successfully!"
+    } else {
+        Write-Warning "Nginx responded with status $($response.StatusCode)"
     }
 } catch {
-    Write-Error "Nginx failed to start. Check logs in $InstallDir\logs\error.log"
+    Write-Error "Nginx failed to start. Check $InstallDir\logs\error.log"
+    Get-Content "$InstallDir\logs\error.log" -Tail 20
 }
 
 # Cleanup
